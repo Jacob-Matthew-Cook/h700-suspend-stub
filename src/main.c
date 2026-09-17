@@ -81,7 +81,6 @@ static __attribute__((noreturn)) void resume_failed(void)
 	stub_panic();
 }
 
-
 static u32 save_lo[SAVE_WORDS];
 static u32 save_hi[SAVE_WORDS];
 static unsigned long save_hi_addr;
