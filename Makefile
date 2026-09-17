@@ -1,66 +1,83 @@
-# SPDX-License-Identifier: GPL-2.0+
-#
-# H616/H700 SRAM suspend stub for TF-A SYSTEM_SUSPEND.
-#
-#   make UBOOT=../u-boot BOARD=rg34xxsp_lpddr4
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Builds one suspend stub. Expects SRC_DIR, UBOOT_DIR, ATF_DIR, DEFCONFIG,
+# OUT and CROSS_COMPILE from the caller; run with -C in a per-variant dir.
 
-UBOOT		?= ../u-boot
-BOARD		?= rg34xxsp_lpddr4
-CROSS_COMPILE	?=
-BUILD		?= build
-# 1: keep DRAM controller/PHY clocked in sleep, 0: shut them down and re-train
-KEEP_PHY	?= 0
+CC := $(CROSS_COMPILE)gcc
+OBJCOPY := $(CROSS_COMPILE)objcopy
+KCONFIG := $(UBOOT_DIR)/arch/arm/mach-sunxi/Kconfig
 
-CC		:= $(CROSS_COMPILE)gcc
-OBJCOPY		:= $(CROSS_COMPILE)objcopy
-SIZE		:= $(CROSS_COMPILE)size
+CFLAGS := -I$(ATF_DIR)/plat/allwinner/sun50i_h616/include -I$(SRC_DIR)/compat -Iboards \
+	-I$(UBOOT_DIR)/arch/arm/include/asm/arch-sunxi \
+	-include $(SRC_DIR)/compat/stub_compat.h -include boards/board.h \
+	-Os -std=gnu11 -march=armv8-a -mgeneral-regs-only -mstrict-align -mcmodel=small \
+	-ffreestanding -fno-builtin -fno-pic -fno-pie -fno-stack-protector -fno-common \
+	-ffunction-sections -fdata-sections -Wall -Wno-unused-function
+LDFLAGS := -march=armv8-a -mgeneral-regs-only -ffreestanding -nostdlib -static -no-pie \
+	-Wl,--gc-sections -Wl,-T,$(SRC_DIR)/stub.lds -Wl,--build-id=none
 
-UBOOT_DRAM_INC	:= $(UBOOT)/arch/arm/include/asm/arch-sunxi
+DRAM := $(shell grep -oE 'CONFIG_SUNXI_DRAM_H616_[A-Z0-9_]+' $(DEFCONFIG) | head -1)
+ifeq ($(DRAM),CONFIG_SUNXI_DRAM_H616_LPDDR4)
+  DRAM_TYPE := 8
+  DRAM_MSTR := (1 << 5)
+  TIMINGS := h616_lpddr4_2133.c
+else ifeq ($(DRAM),CONFIG_SUNXI_DRAM_H616_LPDDR3)
+  DRAM_TYPE := 7
+  DRAM_MSTR := (1 << 3)
+  TIMINGS := h616_lpddr3.c
+else
+  $(error suspend-stub: no known DRAM type in $(DEFCONFIG))
+endif
 
-CPPFLAGS	:= -Iinclude -Icompat -I$(UBOOT_DRAM_INC) \
-		   -include compat/stub_compat.h -include boards/$(BOARD).h \
-		   -DSTUB_DRAM_KEEP_PHY=$(KEEP_PHY)
-CFLAGS		:= -Os -g -std=gnu11 -march=armv8-a -mgeneral-regs-only \
-		   -mstrict-align -mcmodel=small -ffreestanding -fno-builtin \
-		   -fno-pic -fno-pie -fno-stack-protector -fno-common \
-		   -ffunction-sections -fdata-sections -Wall -Wno-unused-function
-ASFLAGS		:= -march=armv8-a -D__ASSEMBLY__
-LDFLAGS		:= -nostdlib -static -no-pie -Wl,--gc-sections -Wl,-T,stub.lds \
-		   -Wl,--build-id=none -Wl,-Map,$(BUILD)/stub.map
+OBJS := src/start.o src/main.o src/lib.o src/clock.o src/dram_sr.o \
+	src/dram/dram_sun50i_h616.o src/dram/dram_dw_helpers.o src/dram/dram_timing.o
 
-DRAM_SRCS	:= src/dram/dram_sun50i_h616.c src/dram/dram_dw_helpers.c \
-		   src/dram/dram_timing.c
-SRCS		:= src/main.c src/lib.c src/clock.c src/dram_sr.c
-OBJS		:= $(BUILD)/start.o $(SRCS:src/%.c=$(BUILD)/%.o) \
-		   $(DRAM_SRCS:src/%.c=$(BUILD)/%.o)
-
-all: $(BUILD)/suspend_stub.bin
-
-$(BUILD)/start.o: src/start.S
-	@mkdir -p $(dir $@)
-	$(CC) $(ASFLAGS) -c $< -o $@
-
-$(BUILD)/%.o: src/%.c src/stub.h include/sunxi_suspend_params.h boards/$(BOARD).h
-	@mkdir -p $(dir $@)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
-
-$(BUILD)/suspend_stub.elf: $(OBJS) stub.lds
-	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $@
-	$(SIZE) $@
-
-$(BUILD)/suspend_stub.bin: $(BUILD)/suspend_stub.elf
+$(SRC_DIR)/$(OUT): stub.elf
 	$(OBJCOPY) -O binary $< $@
-	@ls -l $@
 
-clean:
-	rm -rf $(BUILD)
+stub.elf: $(OBJS) $(SRC_DIR)/stub.lds
+	$(CC) $(LDFLAGS) $(OBJS) -o $@
 
-HOSTCC ?= cc
-test:
-	@mkdir -p $(BUILD)/tests
-	$(HOSTCC) -std=gnu11 -Wall -Wextra -Werror -Itests/mock -Isrc \
-		$(CPPFLAGS) tests/test_transitions.c src/clock.c src/dram_sr.c \
-		-o $(BUILD)/tests/test_transitions
-	$(BUILD)/tests/test_transitions
+src/start.o: $(SRC_DIR)/src/start.S boards/board.h
+	@mkdir -p src
+	$(CC) -march=armv8-a -D__ASSEMBLY__ -c $< -o $@
 
-.PHONY: all clean test
+src/%.o: $(SRC_DIR)/src/%.c boards/board.h
+	@mkdir -p src
+	$(CC) $(CFLAGS) -c $< -o $@
+
+src/dram/%.o: src/dram/%.c boards/board.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# U-Boot's DRAM driver, with the resume path patched in; never the bootloader's own copy
+src/dram/.patched: $(SRC_DIR)/dram-resume.patch
+	@mkdir -p src/dram
+	cp $(UBOOT_DIR)/arch/arm/mach-sunxi/dram_sun50i_h616.c \
+	   $(UBOOT_DIR)/arch/arm/mach-sunxi/dram_dw_helpers.c src/dram/
+	patch -d src/dram -p1 < $<
+	@touch $@
+
+src/dram/dram_sun50i_h616.c src/dram/dram_dw_helpers.c: src/dram/.patched
+
+src/dram/dram_timing.c: $(UBOOT_DIR)/arch/arm/mach-sunxi/dram_timings/$(TIMINGS)
+	@mkdir -p src/dram
+	cp $< $@
+
+# DRAM parameters from the defconfig. A symbol the driver reads but the defconfig
+# leaves unset must have an unconditional numeric Kconfig default: "default X if Y"
+# is per-SoC and would bake in another chip's value. Bools are tested with #ifdef.
+boards/board.h: $(DEFCONFIG) src/dram/dram_sun50i_h616.c src/dram/dram_dw_helpers.c src/dram/dram_timing.c
+	@mkdir -p boards
+	@grep -E '^CONFIG_(DRAM_|SUNXI_DRAM_H616_)' $< | sed -e 's/=y$$/ 1/' -e 's/=/ /' -e 's/^/#define /' > $@
+	@grep -q '^#define CONFIG_DRAM_CLK ' $@ || { echo "suspend-stub: no CONFIG_DRAM_CLK in $<" >&2; exit 1; }
+	@for sym in $$(grep -ohE 'CONFIG_DRAM_[A-Z0-9_]+' $(SRC_DIR)/src/*.[ch] src/dram/*.c | sort -u); do \
+	  grep -q "^#define $$sym " $@ && continue; \
+	  val="$$(awk -v s="config $${sym#CONFIG_}" '$$0 == s { f = 1; next } \
+	    f && /^config / { exit } \
+	    f && /^\tbool/ { print "bool"; exit } \
+	    f && /^\tdefault / { if ($$0 !~ / if / && $$2 ~ /^(0x[0-9a-fA-F]+|[0-9]+)$$/) print $$2; exit }' $(KCONFIG))"; \
+	  [ "$$val" = bool ] && continue; \
+	  [ -n "$$val" ] || { echo "suspend-stub: $$sym is read by the DRAM code but $(notdir $<) does not set it and its Kconfig default is not usable" >&2; exit 1; }; \
+	  echo "#define $$sym $$val" >> $@; \
+	done
+	@echo '#define STUB_DRAM_TYPE $(DRAM_TYPE)' >> $@
+	@echo '#define STUB_MSTR_DEVICETYPE $(DRAM_MSTR)' >> $@
